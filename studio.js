@@ -385,17 +385,49 @@ var relay = null;
 var installed = null;
 var shooting = false;
 var stopFlag = false;
+var brand = null;
 var product = null;
 var lastShot = null;
+var photoZoneOpen = false;
+var sceneChosen = false;
 var SCENES = [
-  { prompt: "on a marble counter, soft morning window light", rec: true },
-  { prompt: "held in hand on a city street, shallow depth of field" },
-  { prompt: "floating on a seamless pastel gradient, hard shadow" },
-  { prompt: "on a picnic table, golden hour, linen + fruit" },
-  { prompt: "editorial flat-lay, magazine style, top-down" }
+  {
+    prompt: "on a marble counter, soft morning window light",
+    cues: ["minimal", "clean", "premium", "luxur", "calm", "quiet", "serene", "spa", "refined"]
+  },
+  {
+    prompt: "held in hand on a city street, shallow depth of field",
+    cues: ["street", "urban", "everyday", "candid", "real", "gen z", "genz", "youth", "movement"]
+  },
+  {
+    prompt: "floating on a seamless pastel gradient, hard shadow",
+    cues: ["bold", "playful", "maximal", "vibrant", "pop", "fun", "loud", "color", "unapologetic"]
+  },
+  {
+    prompt: "on a picnic table, golden hour, linen + fruit",
+    cues: ["warm", "cozy", "home", "natural", "organic", "earth", "craft", "comfort", "desi"]
+  },
+  {
+    prompt: "editorial flat-lay, magazine style, top-down",
+    cues: ["editorial", "magazine", "fashion", "curated", "design", "sophisticat", "studio"]
+  }
 ];
 var ASPECTS = ["1:1", "4:5", "9:16", "16:9"];
-var setup = { scene: 0, steer: "", aspect: "1:1" };
+var setup = { scene: 0, steer: "", aspect: "1:1", chosen: false };
+var recScene = 0;
+function deriveRecScene() {
+  if (!brand) return 0;
+  const hay = `${brand.voice} ${brand.positioning} ${brand.audience}`.toLowerCase();
+  let best = 0, bestScore = 0;
+  SCENES.forEach((s, i) => {
+    const score = s.cues.reduce((n, c) => n + (hay.includes(c) ? 1 : 0), 0);
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  });
+  return best;
+}
 var loadJson = (key, fallback) => {
   try {
     return JSON.parse(localStorage.getItem(key)) ?? fallback;
@@ -452,9 +484,26 @@ mountConnect($("chip-dock"), {
   onConnect: (r) => {
     relay = r;
     reflect();
+    loadBrand();
+  },
+  // The chip's own "Switch ▸" menu lends a different brand — re-derive everything from it,
+  // or the chip and the app silently desync (chip shows the new brand, brief keeps the old one).
+  onProjectChange: (p) => {
+    if (p) applyBrand(p);
   },
   onDisconnect: () => {
     relay = null;
+    brand = null;
+    recScene = 0;
+    photoZoneOpen = false;
+    if (product?.kind === "brand") {
+      product = { kind: "text", name: product.name };
+      saveJson(PRODUCT_KEY, product);
+      $("line").value = product.name;
+    }
+    renderProductViews();
+    renderChips();
+    updateBrief();
     reflect();
   }
 });
@@ -463,27 +512,102 @@ mountConnect($("chip-dock"), {
   installed = !!(r && "connect" in r);
   if (installed) {
     const grant = await r.permissions().catch(() => null);
-    if (grant) relay = r;
+    if (grant) {
+      relay = r;
+      await loadBrand();
+    }
   }
   reflect();
 })();
-function reflect() {
-  $("shoot").disabled = !relay || !product || shooting;
-  const hint = $("conn-hint");
-  if (shooting) hint.textContent = "shooting\u2026";
-  else if (installed === false) hint.innerHTML = `needs the Switchboard extension \u2014 <a href="${INSTALL_URL}" target="_blank" rel="noopener">get it here</a>, it's your key that does the work`;
-  else if (!relay) hint.innerHTML = "connect Switchboard (top right) to run the shoot on <b>your</b> Higgsfield";
-  else if (!product) hint.textContent = "add a product photo \u2014 or load the sample bottle";
-  else hint.innerHTML = "ready \u2014 shoots on <b>your</b> Higgsfield, the operator pays nothing";
+function normalizeBrand(ctx) {
+  const d = ctx && ctx.data || {};
+  const arr = (v) => Array.isArray(v) ? v.filter(Boolean).map(String) : [];
+  const products = arr(d.products).length ? arr(d.products) : arr(d.range);
+  return {
+    name: String(ctx.name || d.name || "Brand"),
+    voice: String(d.voice || d.vibe || d.positioning || "").trim(),
+    positioning: String(d.positioning || "").trim(),
+    audience: String(d.audience || "").trim(),
+    palette: arr(d.palette),
+    // FLAT color strings by contract
+    products
+  };
+}
+async function loadBrand() {
+  if (!relay?.context?.active) {
+    renderBrand();
+    return;
+  }
+  try {
+    const ctx = await relay.context.active();
+    if (ctx) applyBrand(ctx);
+    else renderBrand();
+  } catch {
+    renderBrand();
+  }
+}
+async function pickBrand() {
+  if (!relay?.context?.pick) {
+    logLine("this Switchboard build has no context picker.", "bad");
+    return;
+  }
+  try {
+    const ctx = await relay.context.pick();
+    if (ctx) {
+      applyBrand(ctx);
+      logLine(`brand lent \u2014 shooting for ${brand.name} now.`, "good");
+    }
+  } catch {
+    logLine("brand pick didn't complete.", "bad");
+  }
+}
+$("brand-switch").addEventListener("click", pickBrand);
+$("brand-pick").addEventListener("click", pickBrand);
+function applyBrand(ctx) {
+  brand = normalizeBrand(ctx);
+  recScene = deriveRecScene();
+  if (product?.sample) setProduct(null);
+  if (!sceneChosen) {
+    setup.scene = recScene;
+    saveSetup();
+  }
+  if (brand.products.length && (!product || product.kind !== "photo")) {
+    const saved = loadJson(PRODUCT_KEY, null);
+    const want = product?.kind === "brand" && product.name || saved?.kind === "brand" && saved.name || null;
+    const name = want && brand.products.includes(want) ? want : brand.products[0];
+    product = { kind: "brand", name };
+    saveJson(PRODUCT_KEY, product);
+  }
+  photoZoneOpen = false;
+  renderBrand();
+  renderProductViews();
+  renderChips();
+  updateBrief();
+  reflect();
+}
+function renderBrand() {
+  const bar = $("brandbar");
+  if (!relay) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  $("brand-on").hidden = !brand;
+  $("brand-off").hidden = !!brand;
+  if (!brand) return;
+  $("brand-name").textContent = brand.name;
+  const sw = $("brand-swatches");
+  sw.textContent = "";
+  for (const c of brand.palette.slice(0, 5)) {
+    const s = document.createElement("span");
+    s.className = "sw";
+    s.style.background = c;
+    sw.append(s);
+  }
+  $("brand-voice").textContent = brand.voice ? `\u201C${brand.voice}\u201D` : "";
 }
 function setProduct(p, { persist = true } = {}) {
   product = p;
-  $("drop-empty").hidden = !!p;
-  $("prod-preview").hidden = !p;
-  if (p) {
-    $("prod-img").src = p.dataUrl;
-    $("prod-name").textContent = p.name;
-  }
   if (persist) {
     if (p) saveJson(PRODUCT_KEY, p);
     else {
@@ -493,7 +617,45 @@ function setProduct(p, { persist = true } = {}) {
       }
     }
   }
+  if (p?.kind === "photo") photoZoneOpen = false;
+  renderProductViews();
+  updateBrief();
   reflect();
+}
+var PROD_NOTE = "every chip shoots straight from the brand \u2014 no photo, no typing. voice + palette ride along in the prompt.";
+function renderProductViews() {
+  const isPhoto = product?.kind === "photo";
+  const brandHasProducts = !!(brand && brand.products.length);
+  $("brand-products").hidden = !brandHasProducts;
+  $("free-product").hidden = brandHasProducts || isPhoto;
+  $("photo-toggle").hidden = !brandHasProducts || isPhoto;
+  $("photo-toggle").textContent = photoZoneOpen ? "never mind \u2014 shoot from the brand" : "shoot from a photo instead";
+  $("drop").hidden = isPhoto || brandHasProducts && !photoZoneOpen || !brandHasProducts;
+  $("prod-preview").hidden = !isPhoto;
+  if (isPhoto) {
+    $("prod-img").src = product.dataUrl;
+    $("prod-name").textContent = product.name;
+    $("sample-tag").hidden = !product.sample;
+  }
+  $("prod-note").textContent = brand && !brand.products.length ? "" : PROD_NOTE;
+  renderProducts();
+}
+function renderProducts() {
+  const mount = $("products");
+  mount.textContent = "";
+  if (!brand) return;
+  brand.products.forEach((name) => {
+    const b = document.createElement("button");
+    b.type = "button";
+    b.className = "pchip" + (product?.kind === "brand" && product.name === name ? " on" : "");
+    b.textContent = name;
+    b.title = `shoot ${name} straight from ${brand.name} \u2014 no photo needed`;
+    b.addEventListener("click", () => {
+      photoZoneOpen = false;
+      setProduct({ kind: "brand", name });
+    });
+    mount.append(b);
+  });
 }
 async function acceptFile(file) {
   if (!file || !/^image\//.test(file.type)) {
@@ -507,40 +669,60 @@ async function acceptFile(file) {
     fr.readAsDataURL(file);
   });
   const dataUrl = await downscale(raw);
-  setProduct({ dataUrl, name: file.name.slice(0, 40) || "product.png", sample: false });
+  setProduct({ kind: "photo", dataUrl, name: file.name.slice(0, 40) || "product.png", sample: false });
 }
 $("file").addEventListener("change", (e) => {
   const f = e.target.files?.[0];
   if (f) acceptFile(f);
   e.target.value = "";
 });
-$("drop").addEventListener("click", (e) => {
-  if (e.target.closest("button")) return;
-  $("file").click();
-});
+$("drop").addEventListener("click", () => $("file").click());
 $("drop").addEventListener("keydown", (e) => {
   if (e.key === "Enter" || e.key === " ") {
     e.preventDefault();
     $("file").click();
   }
 });
-$("drop").addEventListener("dragover", (e) => {
+$("browse-btn").addEventListener("click", () => $("file").click());
+$("photo-toggle").addEventListener("click", () => {
+  photoZoneOpen = !photoZoneOpen;
+  renderProductViews();
+});
+var panel = $("prod-panel");
+panel.addEventListener("dragover", (e) => {
   e.preventDefault();
+  panel.classList.add("over");
   $("drop").classList.add("over");
 });
-$("drop").addEventListener("dragleave", () => $("drop").classList.remove("over"));
-$("drop").addEventListener("drop", (e) => {
+panel.addEventListener("dragleave", () => {
+  panel.classList.remove("over");
+  $("drop").classList.remove("over");
+});
+panel.addEventListener("drop", (e) => {
   e.preventDefault();
+  panel.classList.remove("over");
   $("drop").classList.remove("over");
   const f = e.dataTransfer?.files?.[0];
   if (f) acceptFile(f);
 });
 $("prod-replace").addEventListener("click", () => $("file").click());
-$("prod-remove").addEventListener("click", () => setProduct(null));
-$("sample-btn").addEventListener("click", async (e) => {
-  e.stopPropagation();
+$("prod-remove").addEventListener("click", () => {
+  if (brand?.products.length) setProduct({ kind: "brand", name: brand.products[0] });
+  else {
+    $("line").value = "";
+    setProduct(null);
+  }
+});
+$("sample-btn").addEventListener("click", async () => {
   const dataUrl = await downscale(SAMPLE_DATA_URL);
-  setProduct({ dataUrl, name: "glow-sample.png", sample: true });
+  setProduct({ kind: "photo", dataUrl, name: "glow \u2014 sample bottle", sample: true });
+});
+$("line").addEventListener("input", () => {
+  const v = $("line").value.trim();
+  setProduct(v ? { kind: "text", name: v.slice(0, 120) } : null);
+});
+$("line").addEventListener("keydown", (e) => {
+  if (e.key === "Enter" && !$("shoot").disabled) $("shoot").click();
 });
 function renderChips() {
   const mount = $("chips");
@@ -550,20 +732,24 @@ function renderChips() {
     b.type = "button";
     b.className = "scn" + (i === setup.scene ? " on" : "");
     b.textContent = s.prompt;
-    if (s.rec) {
+    if (i === recScene) {
       const tag = document.createElement("span");
       tag.className = "pick";
       tag.textContent = "our pick";
       b.append(tag);
+      if (brand) b.title = `picked for ${brand.name}'s voice`;
     }
     b.addEventListener("click", () => {
       setup.scene = setup.scene === i ? -1 : i;
+      sceneChosen = true;
+      setup.chosen = true;
       renderChips();
       saveSetup();
       updateBrief();
     });
     mount.append(b);
   });
+  $("scene-note").textContent = brand ? `our pick reads ${brand.name}'s voice and positioning \u2014 the other scenes are one click away.` : "our pick is the safe default \u2014 lend a brand and it re-derives from the brand's voice.";
 }
 function renderAspects() {
   const mount = $("aspects");
@@ -587,15 +773,23 @@ function currentScene() {
   if (setup.scene >= 0 && SCENES[setup.scene]) parts.push(SCENES[setup.scene].prompt);
   const steer = $("steer").value.trim();
   if (steer) parts.push(steer);
-  return parts.join(", ") || SCENES[0].prompt;
+  return parts.join(", ") || SCENES[recScene].prompt;
 }
 function updateBrief() {
   const b = $("brief");
   b.textContent = "";
-  b.append("the brief \u2014 keep this exact product, unchanged label and shape, place it in: ");
-  const strong = document.createElement("b");
-  strong.textContent = currentScene();
-  b.append(strong, ` \xB7 ${setup.aspect}`);
+  const scene = document.createElement("b");
+  scene.textContent = currentScene();
+  if (!product) {
+    b.append("the brief \u2014 pick a product above, then shoot it in: ", scene, ` \xB7 ${setup.aspect}`);
+  } else if (product.kind === "photo") {
+    b.append("the brief \u2014 keep this exact product, unchanged label and shape, place it in: ", scene, ` \xB7 ${setup.aspect}`);
+  } else {
+    const pn = document.createElement("b");
+    pn.textContent = product.name;
+    b.append("the brief \u2014 shoot ", pn, brand && product.kind === "brand" ? ` (${brand.name})` : "", " in: ", scene, ` \xB7 ${setup.aspect}`);
+  }
+  if (brand) b.append(` \xB7 ${brand.name}'s voice + palette ride along`);
 }
 $("steer").addEventListener("input", () => {
   setup.steer = $("steer").value;
@@ -605,6 +799,16 @@ $("steer").addEventListener("input", () => {
 $("steer").addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !$("shoot").disabled) $("shoot").click();
 });
+function reflect() {
+  renderBrand();
+  $("shoot").disabled = !relay || !product || shooting;
+  const hint = $("conn-hint");
+  if (shooting) hint.textContent = "shooting\u2026";
+  else if (installed === false) hint.innerHTML = `needs the Switchboard extension \u2014 <a href="${INSTALL_URL}" target="_blank" rel="noopener">get it here</a>, it's your key that does the work`;
+  else if (!relay) hint.innerHTML = "connect Switchboard (top right) \u2014 your lent brand sets up the shoot for you";
+  else if (!product) hint.textContent = brand?.products.length ? "pick one of the brand's products above" : "type your product in one line, drop a photo, or load the sample";
+  else hint.innerHTML = "ready \u2014 shoots on <b>your</b> Higgsfield, the operator pays nothing";
+}
 var lastLogText = "";
 function logLine(text, cls) {
   $("shootbox").hidden = false;
@@ -622,13 +826,30 @@ function setStatus(text) {
   $("shoot-line").textContent = text;
   logLine(text);
 }
-function shootInstruction(scene, aspect) {
+function brandDirection() {
+  if (!brand) return "";
+  const bits = [];
+  if (brand.voice) bits.push(`brand voice: ${brand.voice}`);
+  if (brand.audience) bits.push(`shot to appeal to: ${brand.audience}`);
+  if (brand.palette.length) bits.push(`accent the set styling, props and backdrop with the brand palette (${brand.palette.join(", ")}) \u2014 never recolor the product itself`);
+  return bits.join(". ");
+}
+function photoShootInstruction(scene, aspect) {
+  const dir = brandDirection();
   return `Shoot ONE professional product photograph using Higgsfield. A reference image of the product is attached with handle "product".
 Steps, in order:
 1) media_upload({filename:"product.png", content_type:"image/png"}) \u2192 relay put_blob({handle:"product", url:<uploadUrl>}) \u2192 media_confirm \u21D2 media_id
 2) Call the Higgsfield generate_image tool with model "nano_banana_pro", aspect_ratio "${aspect}", medias [{role:"image", value: media_id}], and this exact prompt:
-"keep this exact product, unchanged label and shape, place it in: ${scene}"
+"keep this exact product, unchanged label and shape, place it in: ${scene}${dir ? `. ${dir}` : ""}"
 3) Poll until the generation is done, then reply with ONLY the final image URL on its own line.`;
+}
+function textShootInstruction(name, scene, aspect) {
+  const dir = brandDirection();
+  const subject = brand && product?.kind === "brand" ? `"${name}" by ${brand.name}` : `"${name}"`;
+  return `Shoot ONE professional product photograph using the Higgsfield generate_image tool.
+The product: ${subject}. Place it in: ${scene}.
+` + (dir ? `Art direction: ${dir}.
+` : "") + `Use aspect_ratio "${aspect}". Poll until the generation is done, then reply with ONLY the final image URL on its own line.`;
 }
 var shootRun = 0;
 async function shoot(scene, aspect) {
@@ -645,8 +866,10 @@ async function shoot(scene, aspect) {
   reflect();
   let url = null, acc = "";
   try {
-    const attachments = [{ handle: "product", filename: "product.png", contentType: "image/png", dataUrl: product.dataUrl }];
-    for await (const d of relay.stream({ prompt: shootInstruction(scene, aspect), agentic: true, attachments })) {
+    const isPhoto = product.kind === "photo";
+    const attachments = isPhoto ? [{ handle: "product", filename: "product.png", contentType: "image/png", dataUrl: product.dataUrl }] : void 0;
+    const prompt = isPhoto ? photoShootInstruction(scene, aspect) : textShootInstruction(product.name, scene, aspect);
+    for await (const d of relay.stream({ prompt, agentic: true, attachments })) {
       if (stopFlag || run !== shootRun) break;
       if (d.type === "tool_proposed") {
         const n = d.call?.name || "";
@@ -670,8 +893,8 @@ async function shoot(scene, aspect) {
     if (run !== shootRun) return;
     if (stopFlag) return;
     url = url || extractUrl(acc);
-    if (!url) throw new Error("the shoot finished without an image URL \u2014 Retry usually lands it on the second frame");
-    addShot({ id: "s_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), url, caption: scene, aspect, at: Date.now() });
+    if (!url) throw new Error("the shoot finished without an image URL \u2014 Reshoot usually lands it on the second frame");
+    addShot({ id: "s_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6), url, caption: scene, product: product.name, aspect, at: Date.now() });
     setStatus("frame developed \u2713");
     logLine("added to the contact sheet.", "good");
   } catch (err) {
@@ -712,7 +935,7 @@ $("retry").addEventListener("click", () => {
     return;
   }
   if (!product) {
-    logLine("add a product photo (or the sample bottle) first.", "bad");
+    logLine("pick a product (a brand chip, a line, or a photo) first.", "bad");
     return;
   }
   shoot(lastShot.scene, lastShot.aspect);
@@ -739,7 +962,7 @@ function renderSheet() {
     img.loading = "lazy";
     const cap = document.createElement("div");
     cap.className = "cap";
-    cap.textContent = s.caption;
+    cap.textContent = s.product ? `${s.product} \u2014 ${s.caption}` : s.caption;
     const meta = document.createElement("div");
     meta.className = "meta";
     meta.textContent = `${s.aspect} \xB7 ${new Date(s.at).toLocaleDateString()}`;
@@ -755,7 +978,7 @@ function renderSheet() {
         return;
       }
       if (!product) {
-        logLine("add a product photo (or the sample bottle) to reshoot.", "bad");
+        logLine("pick a product (a brand chip, a line, or a photo) to reshoot.", "bad");
         return;
       }
       if (shooting) {
@@ -827,6 +1050,7 @@ $("clear-sheet").addEventListener("click", () => {
 (function boot() {
   const savedSetup = loadJson(SETUP_KEY, null);
   if (savedSetup) {
+    sceneChosen = setup.chosen = !!savedSetup.chosen;
     if (Number.isInteger(savedSetup.scene) && savedSetup.scene >= -1 && savedSetup.scene < SCENES.length) setup.scene = savedSetup.scene;
     if (typeof savedSetup.steer === "string") setup.steer = savedSetup.steer.slice(0, 200);
     if (ASPECTS.includes(savedSetup.aspect)) setup.aspect = savedSetup.aspect;
@@ -834,11 +1058,15 @@ $("clear-sheet").addEventListener("click", () => {
   $("steer").value = setup.steer;
   renderChips();
   renderAspects();
-  updateBrief();
-  const savedProduct = loadJson(PRODUCT_KEY, null);
-  if (savedProduct && typeof savedProduct.dataUrl === "string" && savedProduct.dataUrl.startsWith("data:image/")) {
-    setProduct({ dataUrl: savedProduct.dataUrl, name: savedProduct.name || "product.png", sample: !!savedProduct.sample }, { persist: false });
+  const saved = loadJson(PRODUCT_KEY, null);
+  if (saved?.kind === "photo" && typeof saved.dataUrl === "string" && saved.dataUrl.startsWith("data:image/")) {
+    setProduct({ kind: "photo", dataUrl: saved.dataUrl, name: saved.name || "product.png", sample: !!saved.sample }, { persist: false });
+  } else if (saved?.kind === "text" && typeof saved.name === "string" && saved.name.trim()) {
+    $("line").value = saved.name.slice(0, 120);
+    setProduct({ kind: "text", name: saved.name.slice(0, 120) }, { persist: false });
   }
+  renderProductViews();
+  updateBrief();
   renderSheet();
   reflect();
 })();
